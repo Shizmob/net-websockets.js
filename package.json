@@ -1,0 +1,15 @@
+{
+  "name": "net-websockets",
+  "version": "0.1.0",
+  "description": "Drop-in WebSockets-based replacement for node.js net module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "net",
+    "websockets"
+  ],
+  "author": "Shiz <hi@shiz.me>",
+  "license": "MIT"
+}
