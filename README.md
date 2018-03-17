@@ -8,11 +8,11 @@
 
 ```json
 {
-    ...
     "browser": {
         "net": "net-websockets"
     }
-}```
+}
+```
 
 Then you can use it to connect to WebSocket nodes. I recommend [websocat](https://github.com/vi/websocat) or [websocketd](https://github.com/joewalnes/websocketd) for 
 proxy options.
