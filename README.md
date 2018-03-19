@@ -23,7 +23,7 @@ proxy options.
 The MIT License (MIT)
 
 Copyright (c) 2014 emersion
-Copyright (c) 2017 Shiz
+Copyright (c) 2018 Shiz
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
