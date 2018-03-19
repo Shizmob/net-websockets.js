@@ -12,6 +12,10 @@
   ],
   "author": "Shiz <hi@shiz.me>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Shizmob/net-websockets.js"
+  },
   "dependencies": {
     "debug": "^3.1.0"
   }
