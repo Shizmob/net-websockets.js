@@ -155,6 +155,7 @@ class Socket extends stream.Duplex {
 
 		/* Setup WebSocket */
 		this._ws = new WebSocket(url.format(target));
+		this._ws.binaryType = 'arraybuffer';
 		this._ws.addEventListener('open', () => {
 			this._refreshTimer();
 			this.connecting = false;
@@ -165,33 +166,20 @@ class Socket extends stream.Duplex {
 		});
 		this._ws.addEventListener('message', (e) => {
 			this._refreshTimer();
-
-			const contents = e.data;
- 			const gotBuffer = (buffer) => {
-				this.bytesRead += buffer.length;
-				this.push(buffer);
-			};
-
-			if (typeof contents == 'string') {
-				gotBuffer(Buffer.from(contents));
-			} else if (window.Blob && contents instanceof Blob) {
-				const fileReader = new FileReader();
-				fileReader.addEventListener('load', (e) => {
-					const arr = new Uint8Array(fileReader.result);
-					gotBuffer(Buffer.from(arr));
-				});
-				fileReader.readAsArrayBuffer(contents);
-			} else {
-				console.warn('Cannot read TCP stream: unsupported message type', contents);
-			}
+			const buffer = Buffer.from(e.data);
+			this.bytesRead += buffer.length;
+			this.push(buffer);
 		});
-		this._ws.addEventListener('error', (e) => {});
+		this._ws.addEventListener('error', (e) => {
+			/* Real error information is given in the close event, so don't emit anything here. */
+			this._refreshTimer();
+		});
 		this._ws.addEventListener('close', (e) => {
 			this._refreshTimer();
 			if (e.code > 1000 && e.code < 3000 && (e.wasClean === undefined || !e.wasClean)) {
 				this.emit('error', `[WebSocket error ${e.code}] ${e.reason}`);
 			}
-			if (this.readyState != 'opening' && this.readyState != 'closed') {
+			if (this.readyState != 'closed') {
 				this.destroy();
 			}
 		});
@@ -231,25 +219,22 @@ class Socket extends stream.Duplex {
 	}
 
 	_write(data, encoding, cb) {
-		/* Buffer up writes while connecting; Writable logic takes care of subsequent writes. */
+		this._refreshTimer();
+
+		/* Buffer up writes while connecting. */
 		if (this.connecting) {
-			this._pendingData = data;
-			this._pendingEncoding = encoding;
 			this.once('connect', () => {
 				this._write(data, encoding, cb);
 			});
 			return;
 		}
 
-		this._pendingData = null;
-		this._pendingEncoding = '';
-
-		if (encoding == 'binary' && typeof data == 'string') {
-			/* TODO: maybe apply this for all string inputs? */
-			data = Buffer.from(data, encoding);
+		/* Encode data properly. */
+		if (typeof data == 'string') {
+			data = (new TextEncoder(encoding)).encode(data).buffer;
 		}
 
-		/* Best approximation for when writing is complete, as there is no 'send' event in WebSockets. */
+		/* Best approximation for when writing is complete, as there is no 'sent' event in WebSockets. */
 		this._ws.send(data);
 		process.nextTick(() => {
 			this.bytesWritten += data.length;

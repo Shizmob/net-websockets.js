@@ -1,6 +1,6 @@
 {
   "name": "net-websockets",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drop-in WebSockets-based replacement for node.js net module",
   "main": "index.js",
   "scripts": {
