@@ -11,5 +11,8 @@
     "websockets"
   ],
   "author": "Shiz <hi@shiz.me>",
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "debug": "^3.1.0"
+  }
 }

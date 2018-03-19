@@ -1,16 +1,8 @@
-let stream = require('stream');
-let timers = require('timers');
-let debug = require('debug')('net');
+const stream = require('stream');
+const timers = require('timers');
+const url = require('url');
+const debug = require('debug')('net');
 
-function createServer(...args) {
-	throw new Error('Cannot create server in a browser');
-}
-
-function createConnection(...args) {
-	args = normalizeConnectArgs(args);
-	let s = new Socket(args[0]);
-	return s.connect(...args);
-}
 
 function toNumber(x) {
 	return (x = Number(x)) >= 0 ? x : false;
@@ -20,8 +12,7 @@ function isPipeName(s) {
 	return typeof s === 'string' && toNumber(s) === false;
 }
 
-// Returns an array [options] or [options, cb]
-// It is the same as the argument of Socket.prototype.connect().
+/* Normalize connect() args from the old API to the new object-based one. */
 function normalizeConnectArgs(args) {
 	let options = {};
 	if (typeof args[0] == 'object' && args[0] !== null) {
@@ -29,30 +20,23 @@ function normalizeConnectArgs(args) {
 		options = args[0];
 	} else if (isPipeName(args[0])) {
 		// connect(path, [cb]);
-		options.path = args[0];
+		options.wsurl = args[0];
 	} else {
 		// connect(port, [host], [cb])
 		options.port = args[0];
 		if (typeof args[1] === 'string') {
 			options.host = args[1];
-		} else {
-			options.host = 'localhost';
 		}
 	}
-	let cb = args[args.length - 1];
-	return (typeof cb == 'function') ? [options, cb] : [options];
+	const cb = args[args.length - 1];
+	return (typeof cb === 'function') ? [options, cb] : [options];
 }
 
 
 class Socket extends stream.Duplex {
 
 	constructor(options) {
-		if (typeof options === 'number')
-			options = { fd: options };
-		else if (!options)
-			options = {};
-		
-		super(options);
+		super(options || {});
 
 		this.bufferSize = undefined;
 
@@ -67,36 +51,59 @@ class Socket extends stream.Duplex {
 		this.bytesWritten = 0;
 
 		this.connecting = false;
-		this._host = null;
+		
+		this._timer = null;
+		this._timeout = null;
+		this._ws = null;
 		
 		this.readable = this.writable = false;
 		this._writableState.decodeStrings = false;
 		this.allowHalfOpen = options && options.allowHalfOpen || false;
 	}
 
-	
+
+	/** Socket API */
+
+	setKeepAlive(setting, msecs) {
+		/* XXX: not trivially implementable */
+		return this;
+	}
+
+	setNoDelay() {
+		/* XXX: not relevant for WebSockets */
+		return this;
+	}
+
 	setTimeout(msecs, callback) {
 		if (msecs > 0 && isFinite(msecs)) {
-			timers.enroll(this, msecs);
+			this._timeout = msecs;
+			this._refreshTimer();
 			if (callback) {
 				this.once('timeout', callback);
 			}
 		} else if (msecs === 0) {
-			timers.unenroll(this);
+			this._timeout = null;
+			if (this._timer) {
+				timers.clearTimeout(this._timer);
+				this._timer = null;
+			}
 			if (callback) {
 				this.removeListener('timeout', callback);
 			}
-		}	
+		}
+		return this;	
 	}
 	
-	_onTimeout() {
-		debug('_onTimeout');
-		this.emit('timeout');
+	_refreshTimer() {
+		if (this._timer) {
+			timers.clearTimeout(this._timer);
+		}
+		if (this._timeout !== null) {
+			this._timer = timers.setTimeout(() => this.emit('timeout'), this._timeout);
+		}
 	}
-	
-	setNoDelay() {}
-	setKeepAlive(setting, msecs) {}
-	
+
+
 	address() {
 		return {
 			address: this.remoteAddress,
@@ -105,89 +112,126 @@ class Socket extends stream.Duplex {
 		};	
 	}
 
-
 	listen() {
 		throw new Error('Cannot listen in a browser');
 	}
 
 	connect(options, cb) {
 		if (options === null || typeof options !== 'object') {
-			// Old API:
-			// connect(port, [host], [cb])
-			// connect(path, [cb]);
+			/* Convert from legacy API */
 			return this.connect(normalizeConnectArgs([options, cb]));
 		}
 		if (options.path) {
 			throw new Error('options.path not supported in the browser');
 		}
 
-		this.connecting = true;
-		this.writable = true;
-		this._host = this.remoteAddress = options.host;
-		this.remotePort = options.port;
-		this.remoteFamily = 'IPv4'; // TODO: fix
-
+		/* Already connected? */
 		if (this._ws) {
-			process.nextTick(() => {
-				if(cb) cb();
-			});
-			return;
+			if (cb) {
+				process.nextTick(() => cb());
+			}
+			return this;
+		}
+		if (cb) {
+			this.on('connect', cb);
 		}
 
-		let url = (options.protocol || 'ws://') + (options.host || 'localhost') + ':' + (options.port || 80) + (options.wspath || '/');
-		this._ws = new WebSocket(url);
+		/* Construct WebSockets URL and fill in public fields */
+		let target;
+		if (options.wsurl) {
+			target = url.parse(options.wsurl);
+		} else {
+			target = url.parse(
+				(options.protocol || 'ws://') +
+				(options.host || 'localhost') + ':' + (options.port || 8080) +
+				(options.wspath || '/'));
+		}
+
+		this.connecting = true;
+		this.writable = true;
+		this.remoteAddress = url.hostname;
+		this.remotePort = url.port;
+		this.remoteFamily = 'IPv4'; /* TODO: fix */
+
+		/* Setup WebSocket */
+		this._ws = new WebSocket(url.format(target));
 		this._ws.addEventListener('open', () => {
+			this._refreshTimer();
 			this.connecting = false;
 			this.readable = true;
 
 			this.emit('connect');
 			this.read(0);
 		});
-		this._ws.addEventListener('error', (e) => {
-			// `e` doesn't contain anything useful (https://developer.mozilla.org/en/docs/WebSockets/Writing_WebSocket_client_applications#Connection_errors)
-			this.emit('error', 'An error occured while connecting the WebSocket');
-		});
 		this._ws.addEventListener('message', (e) => {
-			let contents = e.data;
- 			let gotBuffer = (buffer) => {
+			this._refreshTimer();
+
+			const contents = e.data;
+ 			const gotBuffer = (buffer) => {
 				this.bytesRead += buffer.length;
 				this.push(buffer);
 			};
 
 			if (typeof contents == 'string') {
-				let buffer = new Buffer(contents);
-				gotBuffer(buffer);
+				gotBuffer(Buffer.from(contents));
 			} else if (window.Blob && contents instanceof Blob) {
-				let fileReader = new FileReader();
+				const fileReader = new FileReader();
 				fileReader.addEventListener('load', (e) => {
-					let buf = fileReader.result;
-					let arr = new Uint8Array(buf);
-					gotBuffer(new Buffer(arr));
+					const arr = new Uint8Array(fileReader.result);
+					gotBuffer(Buffer.from(arr));
 				});
 				fileReader.readAsArrayBuffer(contents);
 			} else {
 				console.warn('Cannot read TCP stream: unsupported message type', contents);
 			}
 		});
-		this._ws.addEventListener('close', () => {
-			if (this.readyState == 'open') {
+		this._ws.addEventListener('error', (e) => {});
+		this._ws.addEventListener('close', (e) => {
+			this._refreshTimer();
+			if (e.code > 1000 && e.code < 3000 && (e.wasClean === undefined || !e.wasClean)) {
+				this.emit('error', `[WebSocket error ${e.code}] ${e.reason}`);
+			}
+			if (this.readyState != 'opening' && this.readyState != 'closed') {
 				this.destroy();
 			}
 		});
 
-		if (cb) {
-			this.on('connect', cb);
+		return this;
+	}
+
+	end(data, encoding) {
+		super.end(data, encoding);
+		this.writable = false;
+
+		if (this._ws) {
+			this._ws.close();
+			this._ws = null;
 		}
+
+		/* In case we're waiting for an EOF */
+		if (this.readable && !this._readableState.endEmitted)
+			this.read(0);
+		else
+			this._maybeDestroy();
 		
 		return this;
 	}
 
-	_read() {}
+	_maybeDestroy() {
+		if (this.readyState == 'closed' && !this._writableState.length) {
+			this.destroy();
+		}
+	}
+
+	
+	/** Duplex API */
+
+	_read() {
+		/* WebSockets have no explicit read method, it's all handled through 'message' events. */
+	}
 
 	_write(data, encoding, cb) {
-		// If we are still connecting, then buffer this for later.
-		// The Writable logic will buffer up any more writes while
-		// waiting for this one to be done.
+		/* Buffer up writes while connecting; Writable logic takes care of subsequent writes. */
 		if (this.connecting) {
 			this._pendingData = data;
 			this._pendingEncoding = encoding;
@@ -196,64 +240,24 @@ class Socket extends stream.Duplex {
 			});
 			return;
 		}
+
 		this._pendingData = null;
 		this._pendingEncoding = '';
 
 		if (encoding == 'binary' && typeof data == 'string') {
-			// TODO: maybe apply this for all string inputs?
-			// Setting encoding is very important for binary data - otherwise the data gets modified
-			data = new Buffer(data, encoding);
+			/* TODO: maybe apply this for all string inputs? */
+			data = Buffer.from(data, encoding);
 		}
 
-		// Send the data
+		/* Best approximation for when writing is complete, as there is no 'send' event in WebSockets. */
 		this._ws.send(data);
-
 		process.nextTick(() => {
-			//console.log('[tcp] sent: ', data.toString(), data.length);
 			this.bytesWritten += data.length;
 			if (cb) cb();
 		});
 	}
-	
-	write(chunk, encoding, cb) {
-		if (typeof chunk !== 'string' && !(chunk instanceof Buffer))
-			throw new TypeError('invalid data');
-		return super.write(chunk, encoding, cb);
-	}
-	
-	end(data, encoding) {
-		super.end(data, encoding);
-		this.writable = false;
 
-		if (this._ws) {
-			this._ws.close();
-		}
-
-		// just in case we're waiting for an EOF.
-		if (this.readable && !this._readableState.endEmitted)
-			this.read(0);
-		else
-			this.maybeDestroy();
-	}
-	
-	destroySoon() {
-		if (this.writable)
-			this.end();
-		if (this._writableState.finished)
-			this.destroy();
-		else
-			this.once('finish', this.destroy);
-	}
-	
-	maybeDestroy() {
-		if (this.readyState == 'closed' && !this._writableState.length) {
-			socket.destroy();
-		}
-	}
-
-	destroy(exception) {
-		debug('destroy', exception);
-		
+	_destroy(err, cb) {
 		if (this.destroyed) {
 			return;
 		}
@@ -261,13 +265,21 @@ class Socket extends stream.Duplex {
 		this.connecting = false;
 		this.readable = this.writable = false;
 
-		timers.unenroll(this);
-
-		debug('close');
+		if (this._timer) {
+			this._timeout = null;
+			this._refreshTimer();
+		}
 
 		this.destroyed = true;
+		if (cb) {
+			cb(err);
+		}
+
+		return this;
 	}
-	
+
+
+
 }
 
 Object.defineProperty(Socket.prototype, 'readyState', {
@@ -285,6 +297,16 @@ Object.defineProperty(Socket.prototype, 'readyState', {
 		}
 	}
 });
+
+function createServer(...args) {
+	throw new Error('Cannot create server in a browser');
+}
+
+function createConnection(...args) {
+	args = normalizeConnectArgs(args);
+	const s = new Socket(args[0]);
+	return s.connect(...args);
+}
 
 function isIP(input) {
 	if (isIPv4(input)) {
@@ -305,11 +327,11 @@ function isIPv6(input) {
 };
 
 module.exports = {
+	Socket,
+	Stream: Socket,
         createServer,
         createConnection,
         connect: createConnection,
-	Socket,
-	Stream: Socket,
 	isIP,
 	isIPv4,
 	isIPv6
