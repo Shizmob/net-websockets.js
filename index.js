@@ -4,25 +4,17 @@ const url = require('url');
 const debug = require('debug')('net');
 
 
-function toNumber(x) {
-	return (x = Number(x)) >= 0 ? x : false;
-}
-
-function isPipeName(s) {
-	return typeof s === 'string' && toNumber(s) === false;
-}
-
 /* Normalize connect() args from the old API to the new object-based one. */
 function normalizeConnectArgs(args) {
 	let options = {};
-	if (typeof args[0] == 'object' && args[0] !== null) {
-		// connect(options, [cb])
+	if (typeof args[0] === 'object' && args[0] !== null) {
+		/* connect(options, [cb]) */
 		options = args[0];
-	} else if (isPipeName(args[0])) {
-		// connect(path, [cb]);
+	} else if (typeof args[0] === 'string') {
+		/* connect(path, [cb]); */
 		options.wsurl = args[0];
 	} else {
-		// connect(port, [host], [cb])
+		/* connect(port, [host], [cb]) */
 		options.port = args[0];
 		if (typeof args[1] === 'string') {
 			options.host = args[1];
@@ -36,7 +28,9 @@ function normalizeConnectArgs(args) {
 class Socket extends stream.Duplex {
 
 	constructor(options) {
-		super(options || {});
+		options = options || {};
+		options.decodeStrings = false;
+		super(options);
 
 		this.bufferSize = undefined;
 
@@ -51,14 +45,14 @@ class Socket extends stream.Duplex {
 		this.bytesWritten = 0;
 
 		this.connecting = false;
+		this.readable = this.writable = false;
+		this.allowHalfOpen = options.allowHalfOpen || false;
 		
 		this._timer = null;
 		this._timeout = null;
 		this._ws = null;
-		
-		this.readable = this.writable = false;
-		this._writableState.decodeStrings = false;
-		this.allowHalfOpen = options && options.allowHalfOpen || false;
+		this._encoder = null;
+		this._encoding = null;
 	}
 
 
@@ -116,13 +110,23 @@ class Socket extends stream.Duplex {
 		throw new Error('Cannot listen in a browser');
 	}
 
+	/* Our connect() processes three additional entries in `options`:
+	 * - wsurl: Full WebSocket URL to connect to, automatically filled in if the first argument is a string;
+	 * - wspath: The HTTP path component for the WebSocket URL if host and port are given separately;
+	 * - wsprotocols: List of WebSocket protocols to accept (see second argument to WebSocket constructor).
+	 */
 	connect(options, cb) {
 		if (options === null || typeof options !== 'object') {
 			/* Convert from legacy API */
-			return this.connect(normalizeConnectArgs([options, cb]));
+			return this.connect(...normalizeConnectArgs([options, cb]));
 		}
 		if (options.path) {
 			throw new Error('options.path not supported in the browser');
+		}
+		for (let x of ['localAddress', 'localPort', 'hints', 'lookup']) {
+			if (x in options) {
+				console.warn(`options.${x} not supported in the browser, silently ignored`);
+			}
 		}
 
 		/* Already connected? */
@@ -132,11 +136,13 @@ class Socket extends stream.Duplex {
 			}
 			return this;
 		}
+
 		if (cb) {
 			this.on('connect', cb);
 		}
+		this._refreshTimer();
 
-		/* Construct WebSockets URL and fill in public fields */
+		/* Construct WebSockets URL from options. */
 		let target;
 		if (options.wsurl) {
 			target = url.parse(options.wsurl);
@@ -151,10 +157,10 @@ class Socket extends stream.Duplex {
 		this.writable = true;
 		this.remoteAddress = url.hostname;
 		this.remotePort = url.port;
-		this.remoteFamily = 'IPv4'; /* TODO: fix */
+		this.remoteFamily = {4: 'IPv4', 6: 'IPv6'}[options.family || 4] || 'IPv4';
 
-		/* Setup WebSocket */
-		this._ws = new WebSocket(url.format(target));
+		/* Create and set up WebSocket. */
+		this._ws = new WebSocket(url.format(target), options.wsprotocols || []);
 		this._ws.binaryType = 'arraybuffer';
 		this._ws.addEventListener('open', () => {
 			this._refreshTimer();
@@ -179,7 +185,9 @@ class Socket extends stream.Duplex {
 			if (e.code > 1000 && e.code < 3000 && (e.wasClean === undefined || !e.wasClean)) {
 				this.emit('error', `[WebSocket error ${e.code}] ${e.reason}`);
 			}
-			if (this.readyState != 'closed') {
+			if (!this.destroyed) {
+				/* Emit EOF and close: WebSockets can't be write-only. */
+				this.push(null);
 				this.destroy();
 			}
 		});
@@ -191,24 +199,11 @@ class Socket extends stream.Duplex {
 		super.end(data, encoding);
 		this.writable = false;
 
-		if (this._ws) {
-			this._ws.close();
-			this._ws = null;
-		}
-
-		/* In case we're waiting for an EOF */
-		if (this.readable && !this._readableState.endEmitted)
-			this.read(0);
-		else
-			this._maybeDestroy();
-		
-		return this;
-	}
-
-	_maybeDestroy() {
-		if (this.readyState == 'closed' && !this._writableState.length) {
+		if (!this.destroyed && (!this.allowHalfOpen || !this.readable)) {
 			this.destroy();
 		}
+
+		return this;
 	}
 
 	
@@ -230,8 +225,12 @@ class Socket extends stream.Duplex {
 		}
 
 		/* Encode data properly. */
-		if (typeof data == 'string') {
-			data = (new TextEncoder(encoding)).encode(data).buffer;
+		if (typeof data === 'string') {
+			if (encoding !== this._encoding) {
+				this._encoding = encoding;
+				this._encoder = new TextEncoder(encoding);
+			}
+			data = this._encoder.encode(data).buffer;
 		}
 
 		/* Best approximation for when writing is complete, as there is no 'sent' event in WebSockets. */
@@ -247,23 +246,22 @@ class Socket extends stream.Duplex {
 			return;
 		}
 
+		this.destroyed = true;
 		this.connecting = false;
 		this.readable = this.writable = false;
 
+		if (this._ws) {
+			this._ws.close();
+			this._ws = null;
+		}
 		if (this._timer) {
 			this._timeout = null;
 			this._refreshTimer();
 		}
-
-		this.destroyed = true;
 		if (cb) {
 			cb(err);
 		}
-
-		return this;
 	}
-
-
 
 }
 
@@ -304,7 +302,7 @@ function isIP(input) {
 };
 
 function isIPv4(input) {
-	return /^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(input);
+	return /^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(?:\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}$/.test(input);
 };
 
 function isIPv6(input) {
